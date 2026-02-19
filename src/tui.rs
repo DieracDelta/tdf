@@ -836,6 +836,7 @@ impl Tui {
 							'G' if can_zoom => self.update_zoom(Zoom::pan_top),
 							'0' if can_zoom => self.update_zoom(Zoom::pan_left),
 							'$' if can_zoom => self.update_zoom(Zoom::pan_right),
+							'r' => Some(InputAction::Rotate),
 							_ => None
 						}
 					}
@@ -1107,6 +1108,8 @@ H, J, K, L (when zoomed in):
     Pan direction around page
 0/$ (when on fill-screen):
     Scroll to left/right side of page
+r:
+		Rotate by 90 degrees
 ";
 
 pub enum InputAction {
@@ -1115,6 +1118,7 @@ pub enum InputAction {
 	Search(String),
 	QuitApp,
 	Invert,
+	Rotate,
 	Fullscreen,
 	SwitchRenderZoom(crate::FitOrFill)
 }
