@@ -247,7 +247,7 @@ pub async fn display_kitty_images<'es>(
 	placement_state: &mut KittyPlacementState,
 	ev_stream: &'es mut EventStream
 ) -> Result<(), DisplayErr<TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>>> {
-	const TMUX_SLOT_PLACEMENT_BASE_RAW: u32 = u32::MAX - 65536;
+	const TMUX_SLOT_PLACEMENT_BASE_RAW: u32 = u32::MAX - 262_144;
 
 	fn slot_placement_id(slot_idx: usize) -> Option<ImageId> {
 		let slot = u32::try_from(slot_idx).ok()?;
@@ -256,16 +256,39 @@ pub async fn display_kitty_images<'es>(
 			.and_then(NonZeroU32::new)
 	}
 
-	fn move_cursor_tmux(global_x: u16, global_y: u16) -> std::io::Result<()> {
-		let mut writer = TdfTmuxWriter::new(std::io::stdout().lock());
+	fn run_tmux_display_action_at<E: std::error::Error>(
+		action: Action<'_, '_>,
+		x: u16,
+		y: u16
+	) -> Result<ImageId, TransmitError<E>> {
+		let image_id = match action {
+			Action::Display { image_id, .. } => image_id,
+			_ => {
+				return Err(TransmitError::Writing(std::io::Error::other(
+					"tmux atomic display expected Action::Display"
+				)));
+			}
+		};
+
+		let writer = DbgWriter {
+			w: std::io::stdout().lock(),
+			#[cfg(debug_assertions)]
+			buf: String::new()
+		};
+		let mut writer = TdfTmuxWriter::new(writer);
 		// CSI uses 1-based coordinates.
 		write!(
-			writer,
+			&mut writer,
 			"\x1b[{};{}H",
-			usize::from(global_y).saturating_add(1),
-			usize::from(global_x).saturating_add(1)
-		)?;
-		writer.flush()
+			usize::from(y).saturating_add(1),
+			usize::from(x).saturating_add(1)
+		)
+		.map_err(TransmitError::Writing)?;
+		let writer = action
+			.write_transmit_to(writer, Verbosity::Silent)
+			.map_err(TransmitError::Writing)?;
+		drop(writer);
+		Ok(image_id)
 	}
 
 	let images = match display {
@@ -335,27 +358,6 @@ pub async fn display_kitty_images<'es>(
 
 		let slot_idx = desired_slots.len();
 		if is_tmux {
-			let Some(anchor) = tmux_anchor else {
-				return Err(DisplayErr::new_no_imgs(
-					"Couldn't determine tmux pane offsets for kitty placement",
-					TransmitError::Writing(std::io::Error::other(
-						"missing tmux anchor for tmux display"
-					))
-				));
-			};
-			let global_x = anchor
-				.window_offset_x
-				.saturating_add(anchor.pane_left)
-				.saturating_add(pos.x);
-			let global_y = anchor
-				.window_offset_y
-				.saturating_add(anchor.pane_top)
-				.saturating_add(pos.y);
-			move_cursor_tmux(global_x, global_y)
-				.map_err(TransmitError::Writing)
-				.map_err(|e| {
-					DisplayErr::new_no_imgs("Couldn't move cursor in tmux passthrough", e)
-				})?;
 			placement_id_for_display = slot_placement_id(slot_idx);
 		}
 
@@ -381,17 +383,18 @@ pub async fn display_kitty_images<'es>(
 				std::mem::swap(image, &mut fake_image);
 
 				let res = match run_action(Action::Transmit(fake_image), is_tmux, ev_stream).await {
-					Ok(img_id) =>
-						run_action(
-							Action::Display {
-								image_id: img_id,
-								placement_id: placement_id_for_display.unwrap_or(img_id),
-								config
-							},
-							is_tmux,
-							ev_stream
-						)
-						.await,
+					Ok(img_id) => {
+						let display_action = Action::Display {
+							image_id: img_id,
+							placement_id: placement_id_for_display.unwrap_or(img_id),
+							config
+						};
+						if is_tmux {
+							run_tmux_display_action_at(display_action, pos.x, pos.y)
+						} else {
+							run_action(display_action, false, ev_stream).await
+						}
+					}
 					Err(e) => Err(e)
 				};
 
@@ -403,18 +406,19 @@ pub async fn display_kitty_images<'es>(
 					Err(e) => Err((page_num, e))
 				}
 			}
-			MaybeTransferred::Transferred(image_id) => run_action(
-				Action::Display {
+			MaybeTransferred::Transferred(image_id) => {
+				let display_action = Action::Display {
 					image_id: *image_id,
 					placement_id: placement_id_for_display.unwrap_or(*image_id),
 					config
-				},
-				is_tmux,
-				ev_stream
-			)
-			.await
-			.map(|_| ())
-			.map_err(|e| (page_num, e))
+				};
+				let res = if is_tmux {
+					run_tmux_display_action_at(display_action, pos.x, pos.y)
+				} else {
+					run_action(display_action, false, ev_stream).await
+				};
+				res.map(|_| ()).map_err(|e| (page_num, e))
+			}
 		};
 
 		log::debug!("this_err is {this_err:#?}");
