@@ -233,6 +233,18 @@ pub async fn display_kitty_images<'es>(
 	tmux_anchor: Option<TmuxAnchor>,
 	ev_stream: &'es mut EventStream
 ) -> Result<(), DisplayErr<TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>>> {
+	fn move_cursor_tmux(global_x: u16, global_y: u16) -> std::io::Result<()> {
+		let mut writer = TdfTmuxWriter::new(std::io::stdout().lock());
+		// CSI uses 1-based coordinates.
+		write!(
+			writer,
+			"\x1b[{};{}H",
+			usize::from(global_y).saturating_add(1),
+			usize::from(global_x).saturating_add(1)
+		)?;
+		writer.flush()
+	}
+
 	let images = match display {
 		KittyDisplay::NoChange => return Ok(()),
 		KittyDisplay::ClearImages => {
@@ -251,6 +263,20 @@ pub async fn display_kitty_images<'es>(
 			}
 			KittyDisplay::DisplayImages(images) => images
 		};
+
+	if is_tmux {
+		let Some(anchor) = tmux_anchor else {
+			return Err(DisplayErr::new_no_imgs(
+				"Couldn't determine tmux pane offsets for kitty placement",
+				TransmitError::Writing(std::io::Error::other(
+					"missing tmux anchor for tmux display"
+				))
+			));
+		};
+		move_cursor_tmux(anchor.pane_left, anchor.pane_top)
+			.map_err(TransmitError::Writing)
+			.map_err(|e| DisplayErr::new_no_imgs("Couldn't move cursor in tmux passthrough", e))?;
+	}
 
 	let mut err = None;
 	for KittyReadyToDisplay {
