@@ -344,6 +344,8 @@ pub async fn display_kitty_images<'es>(
 			if display_loc.rows == 0 || display_loc.rows > max_rows {
 				display_loc.rows = max_rows;
 			}
+			// Keep tmux placements behind text so switched-away windows are less disruptive.
+			display_loc.z_index = -1;
 		}
 
 		if !is_tmux {

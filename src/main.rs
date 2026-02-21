@@ -28,7 +28,8 @@ use futures_util::{FutureExt as _, stream::StreamExt as _};
 use kittage::{
 	action::Action,
 	delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
-	error::{TerminalError, TransmitError}
+	error::{TerminalError, TransmitError},
+	Verbosity
 };
 use notify::{Event, EventKind, RecursiveMode, Watcher as _};
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -190,20 +191,67 @@ fn query_tmux_pane_active() -> Result<bool, WrappedErr> {
 	let tmux_pane = std::env::var("TMUX_PANE")
 		.map_err(|_| WrappedErr("TMUX_PANE is not set while running inside tmux".into()))?;
 	let output = Command::new("tmux")
-		.args(["display-message", "-p", "-t", &tmux_pane, "#{pane_active}"])
+		.args([
+			"display-message",
+			"-p",
+			"-t",
+			&tmux_pane,
+			"#{pane_active} #{window_active}"
+		])
 		.output()
-		.map_err(|e| WrappedErr(format!("Couldn't query tmux pane active state: {e}").into()))?;
+		.map_err(|e| WrappedErr(format!("Couldn't query tmux pane/window active state: {e}").into()))?;
 
 	if !output.status.success() {
 		let stderr = String::from_utf8_lossy(&output.stderr);
 		return Err(WrappedErr(
-			format!("tmux pane active query failed: {}", stderr.trim()).into()
+			format!("tmux pane/window active query failed: {}", stderr.trim()).into()
 		));
 	}
 
 	let stdout = String::from_utf8_lossy(&output.stdout);
-	let val = stdout.trim();
-	Ok(val == "1")
+	let mut tokens = stdout.split_whitespace();
+	let pane = tokens.next().unwrap_or("0");
+	let window = tokens.next().unwrap_or("0");
+	let active = pane == "1" && window == "1";
+	log::debug!(
+		"tmux active poll pane_active={pane} window_active={window} -> active={active}"
+	);
+	Ok(active)
+}
+
+fn query_tmux_client_tty() -> Result<String, WrappedErr> {
+	let tmux_pane = std::env::var("TMUX_PANE")
+		.map_err(|_| WrappedErr("TMUX_PANE is not set while running inside tmux".into()))?;
+	let output = Command::new("tmux")
+		.args(["display-message", "-p", "-t", &tmux_pane, "#{client_tty}"])
+		.output()
+		.map_err(|e| WrappedErr(format!("Couldn't query tmux client tty: {e}").into()))?;
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		return Err(WrappedErr(
+			format!("tmux client tty query failed: {}", stderr.trim()).into()
+		));
+	}
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let tty = stdout.trim();
+	if tty.is_empty() {
+		return Err(WrappedErr("tmux client tty query returned empty output".into()));
+	}
+	Ok(tty.to_string())
+}
+
+fn write_delete_to_tmux_client_tty(config: DeleteConfig) -> Result<(), WrappedErr> {
+	let tty = query_tmux_client_tty()?;
+	let file = std::fs::OpenOptions::new()
+		.write(true)
+		.open(&tty)
+		.map_err(|e| WrappedErr(format!("Couldn't open tmux client tty {tty}: {e}").into()))?;
+	let _ = Action::Delete(config)
+		.write_transmit_to(file, Verbosity::Silent)
+		.map_err(|e| WrappedErr(format!("Couldn't write kitty delete to tmux client tty: {e}").into()))?;
+	Ok(())
 }
 
 #[tokio::main]
@@ -551,7 +599,9 @@ async fn enter_redraw_loop(
 		let mut needs_redraw = false;
 		let mut should_quit = false;
 		let next_ev = ev_stream.next().fuse();
+		let active_poll_tick = tokio::time::sleep(Duration::from_millis(120)).fuse();
 		tokio::select! {
+			_ = active_poll_tick => {},
 		// First we check if we have any keystrokes
 			Some(ev) = next_ev => {
 				// If we can't get user input, just crash.
@@ -562,12 +612,20 @@ async fn enter_redraw_loop(
 								let _ = run_action(
 								Action::Delete(DeleteConfig {
 									effect: ClearOrDelete::Clear,
-									which: WhichToDelete::All
+									which: WhichToDelete::IdRange(
+										NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX
+									)
 								}),
 								true,
 								&mut ev_stream
 									)
 									.await;
+									let _ = write_delete_to_tmux_client_tty(DeleteConfig {
+										effect: ClearOrDelete::Clear,
+										which: WhichToDelete::IdRange(
+											NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX
+										)
+									});
 									kitty_placement_state.invalidate_tmux();
 									drain_pending_input_events();
 									continue;
@@ -682,6 +740,10 @@ async fn enter_redraw_loop(
 				)
 				.await;
 				if is_tmux {
+					let _ = write_delete_to_tmux_client_tty(DeleteConfig {
+						effect: ClearOrDelete::Delete,
+						which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
+					});
 					kitty_placement_state.invalidate_tmux();
 					drain_pending_input_events();
 				}
@@ -707,30 +769,57 @@ async fn enter_redraw_loop(
 			match query_tmux_pane_active() {
 				Ok(false) => {
 					if tmux_pane_active {
-						let _ = run_action(
-							Action::Delete(DeleteConfig {
-								effect: ClearOrDelete::Clear,
-								which: WhichToDelete::All
+						log::debug!("tmux transition active->inactive; clearing kitty image placements");
+						kitty_placement_state.invalidate_tmux();
+						drain_pending_input_events();
+						tmux_pane_active = false;
+					}
+					let _ = run_action(
+						Action::Delete(DeleteConfig {
+							effect: ClearOrDelete::Clear,
+							which: WhichToDelete::IdRange(
+								NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX
+							)
+						}),
+						true,
+						&mut ev_stream
+					)
+					.await;
+						let _ = write_delete_to_tmux_client_tty(DeleteConfig {
+							effect: ClearOrDelete::Clear,
+							which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
+						});
+					continue;
+				}
+				Ok(true) => {
+					if !tmux_pane_active {
+							log::debug!("tmux transition inactive->active; clearing kitty image placements then redrawing");
+							let _ = run_action(
+								Action::Delete(DeleteConfig {
+									effect: ClearOrDelete::Clear,
+									which: WhichToDelete::IdRange(
+										NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX
+									)
 							}),
 							true,
 							&mut ev_stream
 						)
 						.await;
-						kitty_placement_state.invalidate_tmux();
-						drain_pending_input_events();
-						tmux_pane_active = false;
-					}
-					continue;
-				}
-				Ok(true) => {
-					if !tmux_pane_active {
-						kitty_placement_state.invalidate_tmux();
-						tui.invalidate_render_cache();
-						needs_redraw = true;
+							let _ = write_delete_to_tmux_client_tty(DeleteConfig {
+								effect: ClearOrDelete::Clear,
+								which: WhichToDelete::IdRange(
+									NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX
+								)
+							});
+							kitty_placement_state.invalidate_tmux();
+							tui.invalidate_render_cache();
+							needs_redraw = true;
 					}
 					tmux_pane_active = true;
 				}
-				Err(_) => ()
+				Err(e) => {
+					log::debug!("tmux active poll failed: {e}");
+				}
 			}
 		}
 
