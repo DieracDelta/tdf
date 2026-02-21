@@ -70,7 +70,8 @@ pub async fn run_conversion_loop(
 	receiver: Receiver<ConverterMsg>,
 	picker: Picker,
 	prerender: usize,
-	shms_work: bool
+	shms_work: bool,
+	use_direct_kitty: bool
 ) -> Result<(), SendError<Result<ConvertedPage, RenderError>>> {
 	let mut images = vec![];
 	let mut page: usize = 0;
@@ -83,7 +84,8 @@ pub async fn run_conversion_loop(
 		iteration: &mut usize,
 		prerender: usize,
 		pid: u32,
-		shms_work: bool
+		shms_work: bool,
+		use_direct_kitty: bool
 	) -> Result<Option<ConvertedPage>, RenderError> {
 		if images.is_empty() || *iteration >= prerender {
 			return Ok(None);
@@ -136,8 +138,8 @@ pub async fn run_conversion_loop(
 			y: 0
 		};
 
-		let txt_img = match picker.protocol_type() {
-			ProtocolType::Kitty => {
+			let txt_img = match (picker.protocol_type(), use_direct_kitty) {
+				(ProtocolType::Kitty, true) => {
 				let rn = SystemTime::now()
 					.duration_since(UNIX_EPOCH)
 					.unwrap_or_default()
@@ -161,9 +163,9 @@ pub async fn run_conversion_loop(
 					cell_h: page_info.img_data.cell_h
 				}
 			}
-			_ => ConvertedImage::Generic(
-				picker
-					.new_protocol(dyn_img, img_area, Resize::None)
+				_ => ConvertedImage::Generic(
+					picker
+						.new_protocol(dyn_img, img_area, Resize::None)
 					.map_err(|e| {
 						RenderError::Converting(format!(
 							"Couldn't convert DynamicImage to ratatui image: {e}"
@@ -215,15 +217,16 @@ pub async fn run_conversion_loop(
 				Err(TryRecvError::Disconnected) => return Ok(())
 			}
 
-			match next_page(
-				&mut images,
-				&picker,
-				page,
-				&mut iteration,
-				prerender,
-				pid,
-				shms_work
-			) {
+				match next_page(
+					&mut images,
+					&picker,
+					page,
+					&mut iteration,
+					prerender,
+					pid,
+					shms_work,
+					use_direct_kitty
+				) {
 				Ok(None) => break,
 				Ok(Some(img)) => sender.send(Ok(img))?,
 				Err(e) => sender.send(Err(e))?

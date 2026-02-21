@@ -1,4 +1,4 @@
-use std::{io::Write, num::NonZeroU32};
+use std::{collections::HashMap, io::Write, num::NonZeroU32};
 
 use crossterm::{
 	cursor::MoveTo,
@@ -33,6 +33,19 @@ pub struct KittyReadyToDisplay<'tui> {
 	pub page_num: usize,
 	pub pos: Position,
 	pub display_loc: DisplayLocation
+}
+
+#[derive(Default)]
+pub struct KittyPlacementState {
+	tmux_anchor_ready: bool,
+	active_slots: HashMap<usize, (usize, ImageId)>
+}
+
+impl KittyPlacementState {
+	pub fn invalidate_tmux(&mut self) {
+		self.tmux_anchor_ready = false;
+		self.active_slots.clear();
+	}
 }
 
 pub enum KittyDisplay<'tui> {
@@ -231,8 +244,24 @@ pub async fn display_kitty_images<'es>(
 	display: KittyDisplay<'_>,
 	is_tmux: bool,
 	tmux_anchor: Option<TmuxAnchor>,
+	placement_state: &mut KittyPlacementState,
 	ev_stream: &'es mut EventStream
 ) -> Result<(), DisplayErr<TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>>> {
+	const TMUX_ANCHOR_IMAGE_ID_RAW: u32 = u32::MAX - 1;
+	const TMUX_ANCHOR_PLACEMENT_ID_RAW: u32 = u32::MAX - 2;
+	const TMUX_SLOT_PLACEMENT_BASE_RAW: u32 = u32::MAX - 65536;
+
+	fn nzu(n: u32) -> NonZeroU32 {
+		NonZeroU32::new(n).expect("nonzero constant")
+	}
+
+	fn slot_placement_id(slot_idx: usize) -> Option<ImageId> {
+		let slot = u32::try_from(slot_idx).ok()?;
+		TMUX_SLOT_PLACEMENT_BASE_RAW
+			.checked_add(slot)
+			.and_then(NonZeroU32::new)
+	}
+
 	fn move_cursor_tmux(global_x: u16, global_y: u16) -> std::io::Result<()> {
 		let mut writer = TdfTmuxWriter::new(std::io::stdout().lock());
 		// CSI uses 1-based coordinates.
@@ -258,13 +287,15 @@ pub async fn display_kitty_images<'es>(
 			)
 			.await
 			.map_err(|e| DisplayErr::new_no_imgs("Couldn't clear previous images", e))?;
-
-			return Ok(());
+			if is_tmux {
+				placement_state.invalidate_tmux();
 			}
-			KittyDisplay::DisplayImages(images) => images
-		};
+			return Ok(());
+		}
+		KittyDisplay::DisplayImages(images) => images
+	};
 
-	if is_tmux {
+	if is_tmux && !placement_state.tmux_anchor_ready {
 		let Some(anchor) = tmux_anchor else {
 			return Err(DisplayErr::new_no_imgs(
 				"Couldn't determine tmux pane offsets for kitty placement",
@@ -273,12 +304,61 @@ pub async fn display_kitty_images<'es>(
 				))
 			));
 		};
+
+		let anchor_image_id = nzu(TMUX_ANCHOR_IMAGE_ID_RAW);
+		let anchor_placement_id = nzu(TMUX_ANCHOR_PLACEMENT_ID_RAW);
+
+		let anchor_image = Image {
+			num_or_id: NumberOrId::Id(anchor_image_id),
+			format: PixelFormat::Rgb24(
+				ImageDimensions {
+					width: 1,
+					height: 1
+				},
+				None
+			),
+			medium: Medium::Direct {
+				chunk_size: None,
+				data: (&[0u8, 0u8, 0u8][..]).into()
+			}
+		};
+
+		run_action(Action::Transmit(anchor_image), true, ev_stream)
+			.await
+			.map_err(|e| DisplayErr::new_no_imgs("Couldn't create tmux anchor image", e))?;
+
 		move_cursor_tmux(anchor.pane_left, anchor.pane_top)
 			.map_err(TransmitError::Writing)
-			.map_err(|e| DisplayErr::new_no_imgs("Couldn't move cursor in tmux passthrough", e))?;
+			.map_err(|e| DisplayErr::new_no_imgs("Couldn't move cursor for tmux anchor", e))?;
+
+		run_action(
+			Action::Display {
+				image_id: anchor_image_id,
+				placement_id: anchor_placement_id,
+				config: DisplayConfig {
+					location: DisplayLocation {
+						columns: 1,
+						rows: 1,
+						// keep anchor effectively invisible behind content.
+						z_index: i32::MIN,
+						..DisplayLocation::default()
+					},
+					cursor_movement: CursorMovementPolicy::DontMove,
+					..DisplayConfig::default()
+				}
+			},
+			true,
+			ev_stream
+		)
+		.await
+		.map_err(|e| DisplayErr::new_no_imgs("Couldn't create tmux anchor placement", e))?;
+
+		placement_state.tmux_anchor_ready = true;
+		placement_state.active_slots.clear();
 	}
 
 	let mut err = None;
+	let mut desired_slots: HashMap<usize, (usize, ImageId)> = HashMap::new();
 	for KittyReadyToDisplay {
 		img,
 		page_num,
@@ -286,6 +366,7 @@ pub async fn display_kitty_images<'es>(
 		mut display_loc
 	} in images
 	{
+		let mut placement_id_for_display = None;
 		if is_tmux {
 			let Some(anchor) = tmux_anchor else {
 				return Err(DisplayErr::new_no_imgs(
@@ -308,19 +389,25 @@ pub async fn display_kitty_images<'es>(
 			if display_loc.rows == 0 || display_loc.rows > max_rows {
 				display_loc.rows = max_rows;
 			}
-
-			display_loc.horizontal_offset = i32::from(pos.x);
-			display_loc.vertical_offset = i32::from(pos.y);
 		}
 
-		let config = DisplayConfig {
+		if !is_tmux {
+			execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
+		}
+
+		let mut config = DisplayConfig {
 			location: display_loc,
 			cursor_movement: CursorMovementPolicy::DontMove,
 			..DisplayConfig::default()
 		};
 
-		if !is_tmux {
-			execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
+		let slot_idx = desired_slots.len();
+		if is_tmux {
+			config.parent_id = Some(nzu(TMUX_ANCHOR_IMAGE_ID_RAW));
+			config.parent_placement = Some(nzu(TMUX_ANCHOR_PLACEMENT_ID_RAW));
+			config.location.horizontal_offset = i32::from(pos.x);
+			config.location.vertical_offset = i32::from(pos.y);
+			placement_id_for_display = slot_placement_id(slot_idx);
 		}
 
 		log::debug!("going to display img {img:#?}");
@@ -349,7 +436,7 @@ pub async fn display_kitty_images<'es>(
 						run_action(
 							Action::Display {
 								image_id: img_id,
-								placement_id: img_id,
+								placement_id: placement_id_for_display.unwrap_or(img_id),
 								config
 							},
 							is_tmux,
@@ -370,7 +457,7 @@ pub async fn display_kitty_images<'es>(
 			MaybeTransferred::Transferred(image_id) => run_action(
 				Action::Display {
 					image_id: *image_id,
-					placement_id: *image_id,
+					placement_id: placement_id_for_display.unwrap_or(*image_id),
 					config
 				},
 				is_tmux,
@@ -383,10 +470,40 @@ pub async fn display_kitty_images<'es>(
 
 		log::debug!("this_err is {this_err:#?}");
 
-		if let Err((id, e)) = this_err {
-			let e = err.get_or_insert_with(|| (vec![], e));
-			e.0.push(id);
+		match this_err {
+			Ok(()) => {
+				let image_id = match img {
+					MaybeTransferred::Transferred(id) => *id,
+					MaybeTransferred::NotYet(_) => continue
+				};
+				desired_slots.insert(slot_idx, (page_num, image_id));
+			}
+			Err((id, e)) => {
+				let e = err.get_or_insert_with(|| (vec![], e));
+				e.0.push(id);
+			}
 		}
+	}
+
+	if is_tmux {
+		for (slot_idx, (old_page, old_img)) in placement_state.active_slots.clone() {
+			match desired_slots.get(&slot_idx) {
+				Some((new_page, new_img)) if *new_page == old_page && *new_img == old_img => (),
+				_ => {
+					let slot_pid = slot_placement_id(slot_idx).unwrap_or(old_img);
+					let _ = run_action(
+						Action::Delete(DeleteConfig {
+							effect: ClearOrDelete::Clear,
+							which: WhichToDelete::ImageId(old_img, Some(slot_pid))
+						}),
+						true,
+						ev_stream
+					)
+					.await;
+				}
+			}
+		}
+		placement_state.active_slots = desired_slots;
 	}
 
 	match err {

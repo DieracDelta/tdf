@@ -39,7 +39,10 @@ use ratatui_image::{
 use tdf::{
 	PrerenderLimit,
 	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
-	kitty::{DisplayErr, KittyDisplay, TmuxAnchor, display_kitty_images, do_shms_work, run_action},
+	kitty::{
+		DisplayErr, KittyDisplay, KittyPlacementState, TmuxAnchor, display_kitty_images,
+		do_shms_work, run_action
+	},
 	renderer::{self, MUPDF_BLACK, MUPDF_WHITE, RenderError, RenderInfo, RenderNotif},
 	tui::{BottomMessage, InputAction, MessageSetting, Tui}
 };
@@ -394,7 +397,12 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	}
 
 	tokio::spawn(run_conversion_loop(
-		to_main, from_main, picker, 20, shms_work
+		to_main,
+		from_main,
+		picker,
+		20,
+		shms_work,
+		!is_tmux
 	));
 
 	let file_name = path.file_name().map_or_else(
@@ -491,6 +499,7 @@ async fn enter_redraw_loop(
 	mut main_area: tdf::tui::RenderLayout,
 	font_size: FontSize
 ) -> Result<(), Box<dyn Error>> {
+	let mut kitty_placement_state = KittyPlacementState::default();
 	loop {
 		let mut needs_redraw = false;
 		let mut should_quit = false;
@@ -502,7 +511,7 @@ async fn enter_redraw_loop(
 				let ev = ev.expect("Couldn't get any user input");
 				if is_tmux && is_kitty {
 						match ev {
-							CrosstermEvent::FocusLost => {
+								CrosstermEvent::FocusLost => {
 								let _ = run_action(
 								Action::Delete(DeleteConfig {
 									effect: ClearOrDelete::Clear,
@@ -510,10 +519,11 @@ async fn enter_redraw_loop(
 								}),
 								true,
 								&mut ev_stream
-								)
-								.await;
-								drain_pending_input_events();
-								continue;
+									)
+									.await;
+									kitty_placement_state.invalidate_tmux();
+									drain_pending_input_events();
+									continue;
 							}
 						CrosstermEvent::FocusGained => {
 							tui.invalidate_render_cache();
@@ -625,6 +635,7 @@ async fn enter_redraw_loop(
 				)
 				.await;
 				if is_tmux {
+					kitty_placement_state.invalidate_tmux();
 					drain_pending_input_events();
 				}
 			}
@@ -637,7 +648,11 @@ async fn enter_redraw_loop(
 			to_renderer.send(RenderNotif::Area(main_area.page_area))?;
 			needs_redraw = true;
 			if is_tmux {
-				tmux_anchor = Some(query_tmux_anchor().map_err(|e| Box::new(e) as Box<dyn Error>)?);
+				let new_anchor = query_tmux_anchor().map_err(|e| Box::new(e) as Box<dyn Error>)?;
+				if tmux_anchor != Some(new_anchor) {
+					kitty_placement_state.invalidate_tmux();
+				}
+				tmux_anchor = Some(new_anchor);
 			}
 		}
 
@@ -654,6 +669,7 @@ async fn enter_redraw_loop(
 							&mut ev_stream
 						)
 						.await;
+						kitty_placement_state.invalidate_tmux();
 						drain_pending_input_events();
 						tmux_pane_active = false;
 					}
@@ -661,6 +677,7 @@ async fn enter_redraw_loop(
 				}
 				Ok(true) => {
 					if !tmux_pane_active {
+						kitty_placement_state.invalidate_tmux();
 						tui.invalidate_render_cache();
 						needs_redraw = true;
 					}
@@ -673,7 +690,12 @@ async fn enter_redraw_loop(
 		if needs_redraw {
 			if is_tmux {
 				match query_tmux_anchor() {
-					Ok(anchor) => tmux_anchor = Some(anchor),
+					Ok(anchor) => {
+						if tmux_anchor != Some(anchor) {
+							kitty_placement_state.invalidate_tmux();
+						}
+						tmux_anchor = Some(anchor);
+					}
 					Err(e) if tmux_anchor.is_none() => return Err(Box::new(e) as Box<dyn Error>),
 					Err(_) => ()
 				}
@@ -684,8 +706,14 @@ async fn enter_redraw_loop(
 				to_display = tui.render(f, &main_area, font_size);
 			})?;
 
-			let maybe_err =
-				display_kitty_images(to_display, is_tmux, tmux_anchor, &mut ev_stream).await;
+			let maybe_err = display_kitty_images(
+				to_display,
+				is_tmux,
+				tmux_anchor,
+				&mut kitty_placement_state,
+				&mut ev_stream
+			)
+			.await;
 
 			if let Err(DisplayErr {
 				page_nums_failed_to_transfer,
@@ -713,6 +741,7 @@ async fn enter_redraw_loop(
 								&mut ev_stream
 							)
 							.await;
+							kitty_placement_state.invalidate_tmux();
 							return Err(format!("{user_facing_err}: {source}").into());
 						}
 						tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(

@@ -126,6 +126,7 @@ pub fn start_converting_loop(
 		picker,
 		prerender,
 		// just assume shms work for now, who cares
+		true,
 		true
 	));
 
