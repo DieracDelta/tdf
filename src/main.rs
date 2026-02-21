@@ -8,12 +8,13 @@ use std::{
 	io::{BufReader, Read as _, Stdout, Write as _, stdout},
 	mem,
 	path::PathBuf,
+	process::Command,
 	sync::{Arc, Mutex},
 	time::Duration
 };
 
 use crossterm::{
-	event::EventStream,
+	event::{Event as CrosstermEvent, EventStream, poll, read},
 	execute,
 	terminal::{
 		EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -38,7 +39,7 @@ use ratatui_image::{
 use tdf::{
 	PrerenderLimit,
 	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
-	kitty::{KittyDisplay, display_kitty_images, do_shms_work, run_action},
+	kitty::{DisplayErr, KittyDisplay, TmuxAnchor, display_kitty_images, do_shms_work, run_action},
 	renderer::{self, MUPDF_BLACK, MUPDF_WHITE, RenderError, RenderInfo, RenderNotif},
 	tui::{BottomMessage, InputAction, MessageSetting, Tui}
 };
@@ -66,8 +67,93 @@ fn reset_term() {
 		std::io::stdout(),
 		LeaveAlternateScreen,
 		crossterm::cursor::Show,
-		crossterm::event::DisableMouseCapture
+		crossterm::event::DisableMouseCapture,
+		crossterm::event::DisableFocusChange
 	);
+}
+
+fn drain_pending_input_events() {
+	for _ in 0..256 {
+		let Ok(has_event) = poll(Duration::from_millis(0)) else {
+			break;
+		};
+		if !has_event {
+			break;
+		}
+		let _ = read();
+	}
+}
+
+fn query_tmux_anchor() -> Result<TmuxAnchor, WrappedErr> {
+	let tmux_pane = std::env::var("TMUX_PANE")
+		.map_err(|_| WrappedErr("TMUX_PANE is not set while running inside tmux".into()))?;
+	let output = Command::new("tmux")
+		.args([
+			"display-message",
+			"-p",
+			"-t",
+			&tmux_pane,
+			"#{pane_left} #{pane_top} #{pane_width} #{pane_height}"
+		])
+		.output()
+		.map_err(|e| WrappedErr(format!("Couldn't query tmux pane offsets: {e}").into()))?;
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		return Err(WrappedErr(
+			format!("tmux pane offset query failed: {}", stderr.trim()).into()
+		));
+	}
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let mut parts = stdout.split_whitespace();
+	let pane_left = parts
+		.next()
+		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_left".into()))?
+		.parse::<u16>()
+		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_left: {e}").into()))?;
+	let pane_top = parts
+		.next()
+		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_top".into()))?
+		.parse::<u16>()
+		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_top: {e}").into()))?;
+	let pane_width = parts
+		.next()
+		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_width".into()))?
+		.parse::<u16>()
+		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_width: {e}").into()))?;
+	let pane_height = parts
+		.next()
+		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_height".into()))?
+		.parse::<u16>()
+		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_height: {e}").into()))?;
+
+	Ok(TmuxAnchor {
+		pane_left,
+		pane_top,
+		pane_width,
+		pane_height
+	})
+}
+
+fn query_tmux_pane_active() -> Result<bool, WrappedErr> {
+	let tmux_pane = std::env::var("TMUX_PANE")
+		.map_err(|_| WrappedErr("TMUX_PANE is not set while running inside tmux".into()))?;
+	let output = Command::new("tmux")
+		.args(["display-message", "-p", "-t", &tmux_pane, "#{pane_active}"])
+		.output()
+		.map_err(|e| WrappedErr(format!("Couldn't query tmux pane active state: {e}").into()))?;
+
+	if !output.status.success() {
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		return Err(WrappedErr(
+			format!("tmux pane active query failed: {}", stderr.trim()).into()
+		));
+	}
+
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let val = stdout.trim();
+	Ok(val == "1")
 }
 
 #[tokio::main]
@@ -227,7 +313,8 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		std::io::stdout(),
 		EnterAlternateScreen,
 		crossterm::cursor::Hide,
-		crossterm::event::EnableMouseCapture
+		crossterm::event::EnableMouseCapture,
+		crossterm::event::EnableFocusChange
 	)
 	.map_err(|e| {
 		WrappedErr(
@@ -289,8 +376,22 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	let (to_main, from_converter) = flume::unbounded();
 
 	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
+	let is_tmux = picker.is_tmux() || std::env::var_os("TMUX").is_some();
+	let tmux_anchor = if is_tmux {
+		Some(query_tmux_anchor()?)
+	} else {
+		None
+	};
+	let tmux_pane_active = if is_tmux {
+		query_tmux_pane_active().unwrap_or(true)
+	} else {
+		true
+	};
 
-	let shms_work = is_kitty && do_shms_work(&mut ev_stream).await;
+	let shms_work = is_kitty && !is_tmux && do_shms_work(false, &mut ev_stream).await;
+	if is_kitty && is_tmux {
+		drain_pending_input_events();
+	}
 
 	tokio::spawn(run_conversion_loop(
 		to_main, from_main, picker, 20, shms_work
@@ -320,6 +421,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 				effect: ClearOrDelete::Delete,
 				which: WhichToDelete::IdRange(NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX)
 			}),
+			is_tmux,
 			&mut ev_stream
 		)
 		.await
@@ -348,6 +450,10 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		to_converter,
 		from_converter,
 		fullscreen,
+		is_tmux,
+		is_kitty,
+		tmux_anchor,
+		tmux_pane_active,
 		tui,
 		&mut term,
 		main_area,
@@ -376,55 +482,108 @@ async fn enter_redraw_loop(
 	to_converter: Sender<ConverterMsg>,
 	mut from_converter: RecvStream<'_, Result<ConvertedPage, RenderError>>,
 	mut fullscreen: bool,
+	is_tmux: bool,
+	is_kitty: bool,
+	mut tmux_anchor: Option<TmuxAnchor>,
+	mut tmux_pane_active: bool,
 	mut tui: Tui,
 	term: &mut Terminal<CrosstermBackend<Stdout>>,
 	mut main_area: tdf::tui::RenderLayout,
 	font_size: FontSize
 ) -> Result<(), Box<dyn Error>> {
 	loop {
-		let mut needs_redraw = true;
+		let mut needs_redraw = false;
+		let mut should_quit = false;
 		let next_ev = ev_stream.next().fuse();
 		tokio::select! {
-			// First we check if we have any keystrokes
+		// First we check if we have any keystrokes
 			Some(ev) = next_ev => {
 				// If we can't get user input, just crash.
 				let ev = ev.expect("Couldn't get any user input");
+				if is_tmux && is_kitty {
+						match ev {
+							CrosstermEvent::FocusLost => {
+								let _ = run_action(
+								Action::Delete(DeleteConfig {
+									effect: ClearOrDelete::Clear,
+									which: WhichToDelete::All
+								}),
+								true,
+								&mut ev_stream
+								)
+								.await;
+								drain_pending_input_events();
+								continue;
+							}
+						CrosstermEvent::FocusGained => {
+							tui.invalidate_render_cache();
+							continue;
+						}
+						_ => (),
+					}
+				}
 
 				match tui.handle_event(&ev) {
-					None => needs_redraw = false,
+					None => (),
 					Some(action) => match action {
-						InputAction::Redraw => (),
-						InputAction::QuitApp => return Ok(()),
+						InputAction::Redraw => needs_redraw = true,
+						InputAction::QuitApp => should_quit = true,
 						InputAction::JumpingToPage(page) => {
 							to_renderer.send(RenderNotif::JumpToPage(page))?;
 							to_converter.send(ConverterMsg::GoToPage(page))?;
+							needs_redraw = true;
 						},
-						InputAction::Search(term) => to_renderer.send(RenderNotif::Search(term))?,
-						InputAction::Invert => to_renderer.send(RenderNotif::Invert)?,
-						InputAction::Rotate => to_renderer.send(RenderNotif::Rotate)?,
-						InputAction::Fullscreen => fullscreen = !fullscreen,
+						InputAction::Search(term) => {
+							to_renderer.send(RenderNotif::Search(term))?;
+							needs_redraw = true;
+						}
+						InputAction::Invert => {
+							to_renderer.send(RenderNotif::Invert)?;
+							needs_redraw = true;
+						}
+						InputAction::Rotate => {
+							to_renderer.send(RenderNotif::Rotate)?;
+							needs_redraw = true;
+						}
+						InputAction::Fullscreen => {
+							fullscreen = !fullscreen;
+							needs_redraw = true;
+						}
 						InputAction::SwitchRenderZoom(f_or_f) => {
 							to_renderer.send(RenderNotif::SwitchFitOrFill(f_or_f)).unwrap();
+							needs_redraw = true;
 						}
 					}
 				}
-			},
-			Some(renderer_msg) = tui_rx.next() => {
-				match renderer_msg {
+		},
+		Some(renderer_msg) = tui_rx.next() => {
+			match renderer_msg {
 					Ok(render_info) => match render_info {
 						RenderInfo::NumPages(num) => {
 							tui.set_n_pages(num);
 							to_converter.send(ConverterMsg::NumPages(num))?;
+							needs_redraw = true;
 						},
-						RenderInfo::Page(info) => {
-							tui.got_num_results_on_page(info.page_num, info.result_rects.len());
-							to_converter.send(ConverterMsg::AddImg(info))?;
-						},
-						RenderInfo::Reloaded => tui.set_msg(MessageSetting::Some(BottomMessage::Reloaded)),
+							RenderInfo::Page(info) => {
+								tui.got_num_results_on_page(info.page_num, info.result_rects.len());
+								let should_redraw = tui.is_page_visible(info.page_num);
+								to_converter.send(ConverterMsg::AddImg(info))?;
+								needs_redraw |= should_redraw;
+							},
+						RenderInfo::Reloaded => {
+							tui.set_msg(MessageSetting::Some(BottomMessage::Reloaded));
+							needs_redraw = true;
+						}
 						RenderInfo::SearchResults { page_num, num_results } =>
-							tui.got_num_results_on_page(page_num, num_results),
+							{
+								tui.got_num_results_on_page(page_num, num_results);
+								needs_redraw = true;
+							},
 					},
-					Err(e) => tui.show_error(e),
+					Err(e) => {
+						tui.show_error(e);
+						needs_redraw = true;
+					}
 				}
 			}
 			Some(img_res) = from_converter.next() => {
@@ -435,28 +594,106 @@ async fn enter_redraw_loop(
 							needs_redraw = true;
 						}
 					},
-					Err(e) => tui.show_error(e),
+					Err(e) => {
+						tui.show_error(e);
+						needs_redraw = true;
+					}
 				}
 			},
 		};
+
+		if should_quit {
+			if is_kitty {
+				let _ = run_action(
+					Action::Delete(DeleteConfig {
+						effect: ClearOrDelete::Delete,
+						which: WhichToDelete::IdRange(
+							NonZeroU32::new(1).unwrap()..=NonZeroU32::MAX
+						)
+					}),
+					is_tmux,
+					&mut ev_stream
+				)
+				.await;
+				let _ = run_action(
+					Action::Delete(DeleteConfig {
+						effect: ClearOrDelete::Delete,
+						which: WhichToDelete::All
+					}),
+					is_tmux,
+					&mut ev_stream
+				)
+				.await;
+				if is_tmux {
+					drain_pending_input_events();
+				}
+			}
+			return Ok(());
+		}
 
 		let new_area = Tui::main_layout(&term.get_frame(), fullscreen);
 		if new_area != main_area {
 			main_area = new_area;
 			to_renderer.send(RenderNotif::Area(main_area.page_area))?;
 			needs_redraw = true;
+			if is_tmux {
+				tmux_anchor = Some(query_tmux_anchor().map_err(|e| Box::new(e) as Box<dyn Error>)?);
+			}
+		}
+
+		if is_tmux && is_kitty {
+			match query_tmux_pane_active() {
+				Ok(false) => {
+					if tmux_pane_active {
+						let _ = run_action(
+							Action::Delete(DeleteConfig {
+								effect: ClearOrDelete::Clear,
+								which: WhichToDelete::All
+							}),
+							true,
+							&mut ev_stream
+						)
+						.await;
+						drain_pending_input_events();
+						tmux_pane_active = false;
+					}
+					continue;
+				}
+				Ok(true) => {
+					if !tmux_pane_active {
+						tui.invalidate_render_cache();
+						needs_redraw = true;
+					}
+					tmux_pane_active = true;
+				}
+				Err(_) => ()
+			}
 		}
 
 		if needs_redraw {
+			if is_tmux {
+				match query_tmux_anchor() {
+					Ok(anchor) => tmux_anchor = Some(anchor),
+					Err(e) if tmux_anchor.is_none() => return Err(Box::new(e) as Box<dyn Error>),
+					Err(_) => ()
+				}
+			}
+
 			let mut to_display = KittyDisplay::NoChange;
 			term.draw(|f| {
 				to_display = tui.render(f, &main_area, font_size);
 			})?;
 
-			let maybe_err = display_kitty_images(to_display, &mut ev_stream).await;
+			let maybe_err =
+				display_kitty_images(to_display, is_tmux, tmux_anchor, &mut ev_stream).await;
 
-			if let Err((to_replace, err_desc, enum_err)) = maybe_err {
-				match enum_err {
+			if let Err(DisplayErr {
+				page_nums_failed_to_transfer,
+				user_facing_err,
+				source
+			}) = maybe_err
+			{
+				match source {
 					// This is the error that kitty & ghostty provide us when they delete an
 					// image due to memory constraints, so if we get it, we just fix it by
 					// re-rendering so it don't display it to the user
@@ -465,12 +702,26 @@ async fn enter_redraw_loop(
 					// terminal for the pages around it to see if they were deleted too and if
 					// they were, we re-render them? idk
 					TransmitError::Terminal(TerminalError::NoEntity(_)) => (),
-					_ => tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
-						"{err_desc}: {enum_err}"
-					))))
+					_ => {
+						if is_tmux {
+							let _ = run_action(
+								Action::Delete(DeleteConfig {
+									effect: ClearOrDelete::Delete,
+									which: WhichToDelete::All
+								}),
+								is_tmux,
+								&mut ev_stream
+							)
+							.await;
+							return Err(format!("{user_facing_err}: {source}").into());
+						}
+						tui.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+							"{user_facing_err}: {source}"
+						))));
+					}
 				}
 
-				for page_num in to_replace {
+				for page_num in page_nums_failed_to_transfer {
 					tui.page_failed_display(page_num);
 					// So that they get re-rendered and sent over again
 					to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;

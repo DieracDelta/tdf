@@ -229,6 +229,13 @@ impl Tui {
 		}
 	}
 
+	#[must_use]
+	pub fn is_page_visible(&self, page: usize) -> bool {
+		let pages_shown = self.last_render.pages_shown.max(1);
+		let end = self.page.saturating_add(pages_shown);
+		(self.page..end).contains(&page)
+	}
+
 	fn render_zoomed<'s>(
 		// area of the 'fit-screen' page
 		mut img_area: Rect,
@@ -480,15 +487,19 @@ impl Tui {
 			let to_display = page_sizes
 				.into_iter()
 				.enumerate()
-				.filter_map(|(idx, (width, _, img))| {
-					let maybe_img =
-						Self::render_single_page(frame, img, Rect { width, ..img_area });
+				.filter_map(|(idx, (width, height, img))| {
+					let render_rect = Rect { width, ..img_area };
+					let maybe_img = Self::render_single_page(frame, img, render_rect);
 					img_area.x += width;
 					maybe_img.map(|(img, pos)| KittyReadyToDisplay {
 						img,
 						page_num: idx + self.page,
 						pos,
-						display_loc: DisplayLocation::default()
+						display_loc: DisplayLocation {
+							columns: render_rect.width,
+							rows: height,
+							..DisplayLocation::default()
+						}
 					})
 				})
 				.collect::<Vec<_>>();
@@ -599,6 +610,10 @@ impl Tui {
 
 	pub fn page_failed_display(&mut self, page_num: usize) {
 		self.rendered[page_num].img = None;
+	}
+
+	pub fn invalidate_render_cache(&mut self) {
+		self.last_render.rect = Rect::default();
 	}
 
 	pub fn got_num_results_on_page(&mut self, page_num: usize, num_results: usize) {

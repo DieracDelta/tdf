@@ -8,8 +8,8 @@ use crossterm::{
 };
 use image::DynamicImage;
 use kittage::{
-	AsyncInputReader, ImageDimensions, ImageId, NumberOrId, PixelFormat,
-	action::Action,
+	AsyncInputReader, ImageDimensions, ImageId, NumberOrId, PixelFormat, Verbosity,
+	action::{Action, NONZERO_ONE},
 	delete::{ClearOrDelete, DeleteConfig, WhichToDelete},
 	display::{CursorMovementPolicy, DisplayConfig, DisplayLocation},
 	error::TransmitError,
@@ -19,6 +19,14 @@ use kittage::{
 use ratatui::layout::Position;
 
 use crate::converter::MaybeTransferred;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TmuxAnchor {
+	pub pane_left: u16,
+	pub pane_top: u16,
+	pub pane_width: u16,
+	pub pane_height: u16
+}
 
 pub struct KittyReadyToDisplay<'tui> {
 	pub img: &'tui mut MaybeTransferred,
@@ -31,6 +39,30 @@ pub enum KittyDisplay<'tui> {
 	NoChange,
 	ClearImages,
 	DisplayImages(Vec<KittyReadyToDisplay<'tui>>)
+}
+
+pub struct DisplayErr<E> {
+	pub page_nums_failed_to_transfer: Vec<usize>,
+	pub user_facing_err: &'static str,
+	pub source: E
+}
+
+impl<E> DisplayErr<E> {
+	pub fn new(
+		page_nums_failed_to_transfer: Vec<usize>,
+		user_facing_err: &'static str,
+		source: E
+	) -> Self {
+		Self {
+			page_nums_failed_to_transfer,
+			user_facing_err,
+			source
+		}
+	}
+
+	fn new_no_imgs(user_facing_err: &'static str, source: E) -> Self {
+		Self::new(vec![], user_facing_err, source)
+	}
 }
 
 pub struct DbgWriter<W: Write> {
@@ -60,22 +92,123 @@ impl<W: Write> Write for DbgWriter<W> {
 	}
 }
 
+pub struct TdfTmuxWriter<W: Write> {
+	inner: W,
+	in_passthrough: bool,
+	last_was_esc: bool
+}
+
+impl<W: Write> TdfTmuxWriter<W> {
+	fn new(inner: W) -> Self {
+		Self {
+			inner,
+			in_passthrough: false,
+			last_was_esc: false
+		}
+	}
+
+	fn open_passthrough(&mut self) -> std::io::Result<()> {
+		if !self.in_passthrough {
+			self.inner.write_all(b"\x1bPtmux;")?;
+			self.in_passthrough = true;
+		}
+		Ok(())
+	}
+
+	fn close_passthrough(&mut self) -> std::io::Result<()> {
+		if self.in_passthrough {
+			self.inner.write_all(b"\x1b\\")?;
+			self.in_passthrough = false;
+			self.last_was_esc = false;
+		}
+		Ok(())
+	}
+}
+
+impl<W: Write> Write for TdfTmuxWriter<W> {
+	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+		if buf.is_empty() {
+			return Ok(0);
+		}
+
+		for &b in buf {
+			self.open_passthrough()?;
+
+			if b == 0x1b {
+				self.inner.write_all(&[0x1b, 0x1b])?;
+				self.last_was_esc = true;
+				continue;
+			}
+
+			self.inner.write_all(&[b])?;
+
+			if self.last_was_esc && b == b'\\' {
+				self.close_passthrough()?;
+			}
+
+			self.last_was_esc = false;
+		}
+
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		self.close_passthrough()?;
+		self.inner.flush()
+	}
+}
+
 pub async fn run_action<'es>(
 	action: Action<'_, '_>,
+	is_tmux: bool,
 	ev_stream: &'es mut EventStream
 ) -> Result<ImageId, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
+	let fallback_img_id = match &action {
+		Action::Display { image_id, .. } => Some(*image_id),
+		Action::Transmit(img) | Action::TransmitAndDisplay { image: img, .. } =>
+			match img.num_or_id {
+				NumberOrId::Id(id) => Some(id),
+				NumberOrId::Number(_) => None
+			},
+		Action::Query(img) => match img.num_or_id {
+			NumberOrId::Id(id) => Some(id),
+			NumberOrId::Number(_) => None
+		},
+		Action::Delete(_) => Some(NONZERO_ONE)
+	};
+
 	let writer = DbgWriter {
 		w: std::io::stdout().lock(),
 		#[cfg(debug_assertions)]
 		buf: String::new()
 	};
-	action
-		.execute_async(writer, ev_stream)
-		.await
-		.map(|(_, i)| i)
+
+	if is_tmux && !matches!(action, Action::Query(_)) {
+		let writer = action
+			.write_transmit_to(TdfTmuxWriter::new(writer), Verbosity::Silent)
+			.map_err(TransmitError::Writing)?;
+		drop(writer);
+		return fallback_img_id.ok_or_else(|| {
+			TransmitError::Writing(std::io::Error::other(
+				"tmux non-query action missing deterministic image id"
+			))
+		});
+	}
+
+	if is_tmux {
+		action
+			.execute_async(TdfTmuxWriter::new(writer), ev_stream)
+			.await
+			.map(|(_, i)| i)
+	} else {
+		action
+			.execute_async(writer, ev_stream)
+			.await
+			.map(|(_, i)| i)
+	}
 }
 
-pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
+pub async fn do_shms_work(is_tmux: bool, ev_stream: &mut EventStream) -> bool {
 	let img = DynamicImage::new_rgb8(1, 1);
 	let pid = std::process::id();
 	let Ok(mut k_img) = kittage::image::Image::shm_from(img, &format!("tdf_test_{pid}")) else {
@@ -87,7 +220,7 @@ pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
 
 	enable_raw_mode().unwrap();
 
-	let res = run_action(Action::Query(&k_img), ev_stream).await;
+	let res = run_action(Action::Query(&k_img), is_tmux, ev_stream).await;
 
 	disable_raw_mode().unwrap();
 
@@ -96,51 +229,73 @@ pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
 
 pub async fn display_kitty_images<'es>(
 	display: KittyDisplay<'_>,
+	is_tmux: bool,
+	tmux_anchor: Option<TmuxAnchor>,
 	ev_stream: &'es mut EventStream
-) -> Result<
-	(),
-	(
-		Vec<usize>,
-		&'static str,
-		TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>
-	)
-> {
+) -> Result<(), DisplayErr<TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>>> {
 	let images = match display {
 		KittyDisplay::NoChange => return Ok(()),
-		KittyDisplay::DisplayImages(_) | KittyDisplay::ClearImages => {
+		KittyDisplay::ClearImages => {
 			run_action(
 				Action::Delete(DeleteConfig {
 					effect: ClearOrDelete::Clear,
 					which: WhichToDelete::All
 				}),
+				is_tmux,
 				ev_stream
 			)
 			.await
-			.map_err(|e| (vec![], "Couldn't clear previous images", e))?;
+			.map_err(|e| DisplayErr::new_no_imgs("Couldn't clear previous images", e))?;
 
-			let KittyDisplay::DisplayImages(images) = display else {
-				return Ok(());
-			};
-
-			images
-		}
-	};
+			return Ok(());
+			}
+			KittyDisplay::DisplayImages(images) => images
+		};
 
 	let mut err = None;
 	for KittyReadyToDisplay {
 		img,
 		page_num,
 		pos,
-		display_loc
+		mut display_loc
 	} in images
 	{
+		if is_tmux {
+			let Some(anchor) = tmux_anchor else {
+				return Err(DisplayErr::new_no_imgs(
+					"Couldn't determine tmux pane offsets for kitty placement",
+					TransmitError::Writing(std::io::Error::other(
+						"missing tmux anchor for tmux display"
+					))
+				));
+			};
+
+			if pos.x >= anchor.pane_width || pos.y >= anchor.pane_height {
+				continue;
+			}
+
+			let max_cols = anchor.pane_width.saturating_sub(pos.x);
+			let max_rows = anchor.pane_height.saturating_sub(pos.y);
+			if display_loc.columns == 0 || display_loc.columns > max_cols {
+				display_loc.columns = max_cols;
+			}
+			if display_loc.rows == 0 || display_loc.rows > max_rows {
+				display_loc.rows = max_rows;
+			}
+
+			display_loc.horizontal_offset = i32::from(pos.x);
+			display_loc.vertical_offset = i32::from(pos.y);
+		}
+
 		let config = DisplayConfig {
 			location: display_loc,
 			cursor_movement: CursorMovementPolicy::DontMove,
 			..DisplayConfig::default()
 		};
 
-		execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
+		if !is_tmux {
+			execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
+		}
 
 		log::debug!("going to display img {img:#?}");
 		log::debug!("displaying with config {config:#?}");
@@ -163,15 +318,20 @@ pub async fn display_kitty_images<'es>(
 				};
 				std::mem::swap(image, &mut fake_image);
 
-				let res = run_action(
-					Action::TransmitAndDisplay {
-						image: fake_image,
-						config,
-						placement_id: None
-					},
-					ev_stream
-				)
-				.await;
+				let res = match run_action(Action::Transmit(fake_image), is_tmux, ev_stream).await {
+					Ok(img_id) =>
+						run_action(
+							Action::Display {
+								image_id: img_id,
+								placement_id: img_id,
+								config
+							},
+							is_tmux,
+							ev_stream
+						)
+						.await,
+					Err(e) => Err(e)
+				};
 
 				match res {
 					Ok(img_id) => {
@@ -187,6 +347,7 @@ pub async fn display_kitty_images<'es>(
 					placement_id: *image_id,
 					config
 				},
+				is_tmux,
 				ev_stream
 			)
 			.await
@@ -203,7 +364,11 @@ pub async fn display_kitty_images<'es>(
 	}
 
 	match err {
-		Some((replace, e)) => Err((replace, "Couldn't transfer image to the terminal", e)),
+		Some((replace, e)) => Err(DisplayErr::new(
+			replace,
+			"Couldn't transfer image to the terminal",
+			e
+		)),
 		None => Ok(())
 	}
 }
