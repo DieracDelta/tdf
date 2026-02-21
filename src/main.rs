@@ -90,16 +90,16 @@ fn drain_pending_input_events() {
 fn query_tmux_anchor() -> Result<TmuxAnchor, WrappedErr> {
 	let tmux_pane = std::env::var("TMUX_PANE")
 		.map_err(|_| WrappedErr("TMUX_PANE is not set while running inside tmux".into()))?;
-	let output = Command::new("tmux")
-		.args([
-			"display-message",
-			"-p",
-			"-t",
-			&tmux_pane,
-			"#{pane_left} #{pane_top} #{pane_width} #{pane_height}"
-		])
-		.output()
-		.map_err(|e| WrappedErr(format!("Couldn't query tmux pane offsets: {e}").into()))?;
+	let query_with_format = |fmt: &str| -> Result<std::process::Output, WrappedErr> {
+		Command::new("tmux")
+			.args(["display-message", "-p", "-t", &tmux_pane, fmt])
+			.output()
+			.map_err(|e| WrappedErr(format!("Couldn't query tmux pane offsets: {e}").into()))
+	};
+
+	let output = query_with_format(
+		"#{window_offset_x} #{window_offset_y} #{pane_left} #{pane_top} #{pane_width} #{pane_height}"
+	)?;
 
 	if !output.status.success() {
 		let stderr = String::from_utf8_lossy(&output.stderr);
@@ -108,35 +108,82 @@ fn query_tmux_anchor() -> Result<TmuxAnchor, WrappedErr> {
 		));
 	}
 
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	let mut parts = stdout.split_whitespace();
-	let pane_left = parts
-		.next()
-		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_left".into()))?
-		.parse::<u16>()
-		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_left: {e}").into()))?;
-	let pane_top = parts
-		.next()
-		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_top".into()))?
-		.parse::<u16>()
-		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_top: {e}").into()))?;
-	let pane_width = parts
-		.next()
-		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_width".into()))?
-		.parse::<u16>()
-		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_width: {e}").into()))?;
-	let pane_height = parts
-		.next()
-		.ok_or_else(|| WrappedErr("tmux pane offset query returned no pane_height".into()))?
-		.parse::<u16>()
-		.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_height: {e}").into()))?;
+	let parse_tokens = |tokens: &[&str]| -> Result<TmuxAnchor, WrappedErr> {
+		match tokens {
+			// Newer tmux fields including window offsets.
+			[wx, wy, pl, pt, pw, ph, ..] => {
+				let window_offset_x = wx.parse::<u16>().map_err(|e| {
+					WrappedErr(format!("Couldn't parse tmux window_offset_x: {e}").into())
+				})?;
+				let window_offset_y = wy.parse::<u16>().map_err(|e| {
+					WrappedErr(format!("Couldn't parse tmux window_offset_y: {e}").into())
+				})?;
+				let pane_left = pl
+					.parse::<u16>()
+					.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_left: {e}").into()))?;
+				let pane_top = pt
+					.parse::<u16>()
+					.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_top: {e}").into()))?;
+				let pane_width = pw.parse::<u16>().map_err(|e| {
+					WrappedErr(format!("Couldn't parse tmux pane_width: {e}").into())
+				})?;
+				let pane_height = ph.parse::<u16>().map_err(|e| {
+					WrappedErr(format!("Couldn't parse tmux pane_height: {e}").into())
+				})?;
+				Ok(TmuxAnchor {
+					window_offset_x,
+					window_offset_y,
+					pane_left,
+					pane_top,
+					pane_width,
+					pane_height
+				})
+			}
+			// Fallback for older tmux output: pane offsets only.
+			[pl, pt, pw, ph, ..] => {
+				let pane_left = pl
+					.parse::<u16>()
+					.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_left: {e}").into()))?;
+				let pane_top = pt
+					.parse::<u16>()
+					.map_err(|e| WrappedErr(format!("Couldn't parse tmux pane_top: {e}").into()))?;
+				let pane_width = pw.parse::<u16>().map_err(|e| {
+					WrappedErr(format!("Couldn't parse tmux pane_width: {e}").into())
+				})?;
+				let pane_height = ph.parse::<u16>().map_err(|e| {
+					WrappedErr(format!("Couldn't parse tmux pane_height: {e}").into())
+				})?;
+				Ok(TmuxAnchor {
+					window_offset_x: 0,
+					window_offset_y: 0,
+					pane_left,
+					pane_top,
+					pane_width,
+					pane_height
+				})
+			}
+			_ => Err(WrappedErr("tmux pane offset query returned too few fields".into()))
+		}
+	};
 
-	Ok(TmuxAnchor {
-		pane_left,
-		pane_top,
-		pane_width,
-		pane_height
-	})
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let tokens = stdout.split_whitespace().collect::<Vec<_>>();
+	let anchor = if tokens.len() >= 6 {
+		parse_tokens(&tokens)?
+	} else {
+		let fallback = query_with_format("#{pane_left} #{pane_top} #{pane_width} #{pane_height}")?;
+		if !fallback.status.success() {
+			let stderr = String::from_utf8_lossy(&fallback.stderr);
+			return Err(WrappedErr(
+				format!("tmux pane offset fallback query failed: {}", stderr.trim()).into()
+			));
+		}
+		let fb_stdout = String::from_utf8_lossy(&fallback.stdout);
+		let fb_tokens = fb_stdout.split_whitespace().collect::<Vec<_>>();
+		parse_tokens(&fb_tokens)?
+	};
+
+	Ok(anchor)
 }
 
 fn query_tmux_pane_active() -> Result<bool, WrappedErr> {
@@ -402,7 +449,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		picker,
 		20,
 		shms_work,
-		!is_tmux
+		is_kitty
 	));
 
 	let file_name = path.file_name().map_or_else(

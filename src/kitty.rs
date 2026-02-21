@@ -22,6 +22,8 @@ use crate::converter::MaybeTransferred;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TmuxAnchor {
+	pub window_offset_x: u16,
+	pub window_offset_y: u16,
 	pub pane_left: u16,
 	pub pane_top: u16,
 	pub pane_width: u16,
@@ -37,13 +39,11 @@ pub struct KittyReadyToDisplay<'tui> {
 
 #[derive(Default)]
 pub struct KittyPlacementState {
-	tmux_anchor_ready: bool,
 	active_slots: HashMap<usize, (usize, ImageId)>
 }
 
 impl KittyPlacementState {
 	pub fn invalidate_tmux(&mut self) {
-		self.tmux_anchor_ready = false;
 		self.active_slots.clear();
 	}
 }
@@ -247,13 +247,7 @@ pub async fn display_kitty_images<'es>(
 	placement_state: &mut KittyPlacementState,
 	ev_stream: &'es mut EventStream
 ) -> Result<(), DisplayErr<TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>>> {
-	const TMUX_ANCHOR_IMAGE_ID_RAW: u32 = u32::MAX - 1;
-	const TMUX_ANCHOR_PLACEMENT_ID_RAW: u32 = u32::MAX - 2;
 	const TMUX_SLOT_PLACEMENT_BASE_RAW: u32 = u32::MAX - 65536;
-
-	fn nzu(n: u32) -> NonZeroU32 {
-		NonZeroU32::new(n).expect("nonzero constant")
-	}
 
 	fn slot_placement_id(slot_idx: usize) -> Option<ImageId> {
 		let slot = u32::try_from(slot_idx).ok()?;
@@ -292,70 +286,8 @@ pub async fn display_kitty_images<'es>(
 			}
 			return Ok(());
 		}
-		KittyDisplay::DisplayImages(images) => images
-	};
-
-	if is_tmux && !placement_state.tmux_anchor_ready {
-		let Some(anchor) = tmux_anchor else {
-			return Err(DisplayErr::new_no_imgs(
-				"Couldn't determine tmux pane offsets for kitty placement",
-				TransmitError::Writing(std::io::Error::other(
-					"missing tmux anchor for tmux display"
-				))
-			));
+			KittyDisplay::DisplayImages(images) => images
 		};
-
-		let anchor_image_id = nzu(TMUX_ANCHOR_IMAGE_ID_RAW);
-		let anchor_placement_id = nzu(TMUX_ANCHOR_PLACEMENT_ID_RAW);
-
-		let anchor_image = Image {
-			num_or_id: NumberOrId::Id(anchor_image_id),
-			format: PixelFormat::Rgb24(
-				ImageDimensions {
-					width: 1,
-					height: 1
-				},
-				None
-			),
-			medium: Medium::Direct {
-				chunk_size: None,
-				data: (&[0u8, 0u8, 0u8][..]).into()
-			}
-		};
-
-		run_action(Action::Transmit(anchor_image), true, ev_stream)
-			.await
-			.map_err(|e| DisplayErr::new_no_imgs("Couldn't create tmux anchor image", e))?;
-
-		move_cursor_tmux(anchor.pane_left, anchor.pane_top)
-			.map_err(TransmitError::Writing)
-			.map_err(|e| DisplayErr::new_no_imgs("Couldn't move cursor for tmux anchor", e))?;
-
-		run_action(
-			Action::Display {
-				image_id: anchor_image_id,
-				placement_id: anchor_placement_id,
-				config: DisplayConfig {
-					location: DisplayLocation {
-						columns: 1,
-						rows: 1,
-						// keep anchor effectively invisible behind content.
-						z_index: i32::MIN,
-						..DisplayLocation::default()
-					},
-					cursor_movement: CursorMovementPolicy::DontMove,
-					..DisplayConfig::default()
-				}
-			},
-			true,
-			ev_stream
-		)
-		.await
-		.map_err(|e| DisplayErr::new_no_imgs("Couldn't create tmux anchor placement", e))?;
-
-		placement_state.tmux_anchor_ready = true;
-		placement_state.active_slots.clear();
-	}
 
 	let mut err = None;
 	let mut desired_slots: HashMap<usize, (usize, ImageId)> = HashMap::new();
@@ -395,7 +327,7 @@ pub async fn display_kitty_images<'es>(
 			execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
 		}
 
-		let mut config = DisplayConfig {
+		let config = DisplayConfig {
 			location: display_loc,
 			cursor_movement: CursorMovementPolicy::DontMove,
 			..DisplayConfig::default()
@@ -403,10 +335,27 @@ pub async fn display_kitty_images<'es>(
 
 		let slot_idx = desired_slots.len();
 		if is_tmux {
-			config.parent_id = Some(nzu(TMUX_ANCHOR_IMAGE_ID_RAW));
-			config.parent_placement = Some(nzu(TMUX_ANCHOR_PLACEMENT_ID_RAW));
-			config.location.horizontal_offset = i32::from(pos.x);
-			config.location.vertical_offset = i32::from(pos.y);
+			let Some(anchor) = tmux_anchor else {
+				return Err(DisplayErr::new_no_imgs(
+					"Couldn't determine tmux pane offsets for kitty placement",
+					TransmitError::Writing(std::io::Error::other(
+						"missing tmux anchor for tmux display"
+					))
+				));
+			};
+			let global_x = anchor
+				.window_offset_x
+				.saturating_add(anchor.pane_left)
+				.saturating_add(pos.x);
+			let global_y = anchor
+				.window_offset_y
+				.saturating_add(anchor.pane_top)
+				.saturating_add(pos.y);
+			move_cursor_tmux(global_x, global_y)
+				.map_err(TransmitError::Writing)
+				.map_err(|e| {
+					DisplayErr::new_no_imgs("Couldn't move cursor in tmux passthrough", e)
+				})?;
 			placement_id_for_display = slot_placement_id(slot_idx);
 		}
 
