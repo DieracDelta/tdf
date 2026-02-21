@@ -1527,6 +1527,7 @@ dependencies = [
 [[package]]
 name = "kittage"
 version = "0.3.4"
+source = "git+https://github.com/DieracDelta/kittage.git?branch=main#a37a5f8249d0721938fa555e9fb328c7bba5dedd"
 dependencies = [
  "base64-simd",
  "crossterm",
